@@ -2,77 +2,113 @@ const http = require('http');
 const { WebSocketServer } = require('ws');
 const { WebcastPushConnection } = require('tiktok-live-connector');
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000;
 
 const server = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-  res.end('TikTok Live Bridge dang hoat dong!');
+  res.end('TikTok Bridge is running');
 });
 
 const wss = new WebSocketServer({ server });
 
 wss.on('connection', (ws, req) => {
-  const url = new URL(req.url, `http://${req.headers.host}`);
-  let uniqueId = (url.searchParams.get('uniqueId') || url.searchParams.get('id') || '').replace(/^@+/, '');
-  let tiktokConn = null;
+  let uniqueId = '';
+  try {
+    const reqUrl = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+    uniqueId = (reqUrl.searchParams.get('uniqueId') || '').replace(/^@/, '').trim();
+  } catch (e) {
+    uniqueId = '';
+  }
 
-  const startTikTok = (id) => {
-    if (!id) return;
-    if (tiktokConn) {
-      try {
-        tiktokConn.disconnect();
-      } catch (e) {}
-    }
+  if (!uniqueId) {
+    ws.send(JSON.stringify({ type: 'error', message: 'Thiếu ID TikTok Live (uniqueId)' }));
+    ws.close();
+    return;
+  }
 
-    tiktokConn = new WebcastPushConnection(id, { processInitialData: false });
+  ws.send(JSON.stringify({ type: 'status', message: `Đang kết nối tới @${uniqueId}...` }));
 
-    tiktokConn.connect()
-      .then(() => {
-        ws.send(JSON.stringify({ type: 'join', user: `@${id}` }));
-      })
-      .catch((err) => {
-        ws.send(JSON.stringify({ type: 'error', message: err.message }));
-      });
+  const tiktokConnection = new WebcastPushConnection(uniqueId, {
+    enableExtendedGiftInfo: true,
+    processInitialGifts: false
+  });
 
-    tiktokConn.on('gift', (data) => {
-      if (data.giftType === 1 && !data.repeatEnd) return;
-      const count = data.repeatCount || 1;
-      const totalCoins = (data.diamondCount || 1) * count;
-      ws.send(JSON.stringify({
-        type: 'gift',
-        user: data.nickname || data.uniqueId || 'Khán giả',
-        giftName: data.giftName || 'Quà TikTok',
-        coins: totalCoins
-      }));
+  tiktokConnection
+    .connect()
+    .then((state) => {
+      if (ws.readyState === ws.OPEN) {
+        ws.send(JSON.stringify({
+          type: 'connected',
+          roomId: state.roomId || '',
+          message: `Đã kết nối LIVE @${uniqueId}`
+        }));
+      }
+    })
+    .catch((err) => {
+      if (ws.readyState === ws.OPEN) {
+        const msg = err && err.message ? err.message : String(err);
+        ws.send(JSON.stringify({
+          type: 'error',
+          message: `Không vào được phòng @${uniqueId}: ${msg}`
+        }));
+      }
     });
 
-    tiktokConn.on('chat', (data) => {
+  tiktokConnection.on('chat', (data) => {
+    if (ws.readyState === ws.OPEN) {
       ws.send(JSON.stringify({
-        type: 'comment',
-        user: data.nickname || data.uniqueId || 'Khán giả',
+        type: 'chat',
+        nickname: data.nickname || data.uniqueId || 'Khán giả',
         comment: data.comment || ''
       }));
-    });
-  };
-
-  if (uniqueId) startTikTok(uniqueId);
-
-  ws.on('message', (msg) => {
-    try {
-      const payload = JSON.parse(msg.toString());
-      if (payload.uniqueId) {
-        startTikTok(String(payload.uniqueId).replace(/^@+/, ''));
-      }
-    } catch (e) {}
-  });
-
-  ws.on('close', () => {
-    if (tiktokConn) {
-      try {
-        tiktokConn.disconnect();
-      } catch (e) {}
     }
   });
+
+  tiktokConnection.on('gift', (data) => {
+    if (ws.readyState === ws.OPEN) {
+      const repeatCount = Number(data.repeatCount) || 1;
+      const diamondCount = Number(data.diamondCount) || 1;
+      const isStreakEnding = data.giftType === 1 ? Boolean(data.repeatEnd) : true;
+
+      if (isStreakEnding) {
+        ws.send(JSON.stringify({
+          type: 'gift',
+          nickname: data.nickname || data.uniqueId || 'Khán giả',
+          giftName: data.giftName || 'Quà tặng',
+          repeatCount,
+          coins: diamondCount * repeatCount
+        }));
+      }
+    }
+  });
+
+  tiktokConnection.on('streamEnd', () => {
+    if (ws.readyState === ws.OPEN) {
+      ws.send(JSON.stringify({
+        type: 'error',
+        message: `Phiên LIVE của @${uniqueId} đã kết thúc.`
+      }));
+    }
+  });
+
+  tiktokConnection.on('error', (err) => {
+    if (ws.readyState === ws.OPEN) {
+      const msg = err && err.message ? err.message : String(err);
+      ws.send(JSON.stringify({
+        type: 'error',
+        message: `Lỗi kết nối TikTok (@${uniqueId}): ${msg}`
+      }));
+    }
+  });
+
+  const cleanup = () => {
+    try {
+      tiktokConnection.disconnect();
+    } catch (e) {}
+  };
+
+  ws.on('close', cleanup);
+  ws.on('error', cleanup);
 });
 
 server.listen(PORT, () => {
